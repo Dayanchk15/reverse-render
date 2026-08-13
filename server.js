@@ -1,42 +1,54 @@
-import http from "http";
-import httpProxy from "http-proxy";
+import http from "node:http";
+import WebSocket, { WebSocketServer } from "ws";
 
-const PORT = process.env.PORT || 10000;
-const UPSTREAM_URL = process.env.UPSTREAM_URL;
+const port = Number(process.env.PORT || 10000);
+const upstreamUrl = process.env.UPSTREAM_WS_URL;
 
-if (!UPSTREAM_URL) {
-  throw new Error("UPSTREAM_URL is not set");
+if (!upstreamUrl) {
+  throw new Error("UPSTREAM_WS_URL is required");
 }
 
-const proxy = httpProxy.createProxyServer({
-  target: UPSTREAM_URL,
-  changeOrigin: true,
-  ws: true,
+const httpServer = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200);
+    res.end("ok");
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("not found");
 });
 
-proxy.on("error", (err, req, res) => {
-  console.error("Proxy error:", err.message);
+const wss = new WebSocketServer({ server: httpServer });
 
-  if (res && !res.headersSent) {
-    res.writeHead(502, {
-      "Content-Type": "text/plain",
+wss.on("connection", (client) => {
+  const upstream = new WebSocket(upstreamUrl);
+
+  upstream.on("open", () => {
+    client.on("message", (data, binary) => {
+      if (upstream.readyState === WebSocket.OPEN) {
+        upstream.send(data, { binary });
+      }
     });
-  }
 
-  if (res) {
-    res.end("Bad Gateway");
-  }
+    upstream.on("message", (data, binary) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(data, { binary });
+      }
+    });
+  });
+
+  const close = () => {
+    if (client.readyState !== WebSocket.CLOSED) client.close();
+    if (upstream.readyState !== WebSocket.CLOSED) upstream.close();
+  };
+
+  client.on("close", close);
+  upstream.on("close", close);
+  client.on("error", close);
+  upstream.on("error", close);
 });
 
-const server = http.createServer((req, res) => {
-  proxy.web(req, res);
-});
-
-server.on("upgrade", (req, socket, head) => {
-  proxy.ws(req, socket, head);
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Reverse proxy listening on ${PORT}`);
-  console.log(`Upstream: ${UPSTREAM_URL}`);
+httpServer.listen(port, "0.0.0.0", () => {
+  console.log(`relay listening on ${port}`);
 });
