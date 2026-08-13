@@ -1,11 +1,11 @@
 {
-  "name": "reverse-render",
+  "name": "fornex-render-relay",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "http-proxy": "^1.18.1"
+    "ws": "^8.18.0"
   }
 }
