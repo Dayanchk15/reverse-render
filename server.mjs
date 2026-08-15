@@ -1,92 +1,125 @@
-import http from "node:http";
+import http from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
 
-const port = Number(process.env.PORT || 10000);
-const originText = process.env.SUBSCRIPTION_ORIGIN || "https://sub.twidu.com";
-const timeoutMs = Number(process.env.UPSTREAM_TIMEOUT_MS || 15000);
+const PORT = Number(process.env.PORT || 8080);
+const UPSTREAM_WS_URL = String(process.env.UPSTREAM_WS_URL || '').trim();
 
-let origin;
-try {
-  origin = new URL(originText);
-} catch {
-  throw new Error("SUBSCRIPTION_ORIGIN must be a valid URL");
-}
-
-if (origin.protocol !== "https:") {
-  throw new Error("SUBSCRIPTION_ORIGIN must use HTTPS");
-}
-
-// This service is deliberately limited to the subscription API. It is not an
-// open proxy and will never fetch arbitrary user-supplied URLs.
-const subscriptionPath = /^\/api\/sub\/[A-Za-z0-9._~-]+$/;
-
-function send(res, status, body, contentType = "text/plain; charset=utf-8") {
-  res.writeHead(status, {
-    "content-type": contentType,
-    "cache-control": "no-store, no-cache, must-revalidate",
-    "x-content-type-options": "nosniff",
-    "content-length": Buffer.byteLength(body)
-  });
-  res.end(body);
-}
-
-async function proxySubscription(req, res, pathname, search) {
-  const upstream = new URL(pathname + search, origin);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const upstreamResponse = await fetch(upstream, {
-      method: "GET",
-      redirect: "manual",
-      signal: controller.signal,
-      headers: {
-        accept: req.headers.accept || "*/*",
-        "user-agent": "subscription-relay/1.0"
-      }
-    });
-
-    // A redirect would expose the old origin and defeat the purpose of this
-    // endpoint, so return an error instead of forwarding it to clients.
-    if (upstreamResponse.status >= 300 && upstreamResponse.status < 400) {
-      send(res, 502, "upstream returned redirect\n");
-      return;
-    }
-
-    const body = Buffer.from(await upstreamResponse.arrayBuffer());
-    const contentType = upstreamResponse.headers.get("content-type") ||
-      "text/plain; charset=utf-8";
-    send(res, upstreamResponse.status, body, contentType);
-  } catch (error) {
-    const message = error?.name === "AbortError" ? "upstream timeout" : "upstream unavailable";
-    send(res, 502, `${message}\n`);
-  } finally {
-    clearTimeout(timer);
+function parseUpstreamRoutes() {
+  const raw = String(process.env.UPSTREAM_ROUTES || '').trim();
+  if (!raw) return null;
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('UPSTREAM_ROUTES must be a JSON object of path -> ws url');
   }
+  const routes = new Map();
+  for (const [pathKey, url] of Object.entries(parsed)) {
+    const path = String(pathKey || '').trim();
+    const upstream = String(url || '').trim();
+    if (!path.startsWith('/')) continue;
+    if (!upstream) continue;
+    routes.set(path, upstream);
+  }
+  if (!routes.size) throw new Error('UPSTREAM_ROUTES is empty');
+  return routes;
 }
 
-const server = http.createServer(async (req, res) => {
-  const requestUrl = new URL(req.url || "/", "http://relay.local");
+const UPSTREAM_ROUTES = parseUpstreamRoutes();
 
-  if (req.method === "GET" && requestUrl.pathname === "/health") {
-    send(res, 200, "OK\n");
+if (!UPSTREAM_WS_URL && !UPSTREAM_ROUTES) {
+  console.error('UPSTREAM_WS_URL or UPSTREAM_ROUTES is required');
+  process.exit(1);
+}
+
+function resolveUpstreamUrl(requestUrl) {
+  const url = String(requestUrl || '/').split('?')[0] || '/';
+  if (UPSTREAM_ROUTES) {
+    if (UPSTREAM_ROUTES.has(url)) return UPSTREAM_ROUTES.get(url);
+    const withSlash = url.endsWith('/') ? url : `${url}/`;
+    if (UPSTREAM_ROUTES.has(withSlash)) return UPSTREAM_ROUTES.get(withSlash);
+    const noSlash = url.replace(/\/+$/, '') || '/';
+    if (UPSTREAM_ROUTES.has(noSlash)) return UPSTREAM_ROUTES.get(noSlash);
+    return null;
+  }
+  return UPSTREAM_WS_URL;
+}
+
+const server = http.createServer((req, res) => {
+  const url = req.url || '/';
+  if (url === '/health' || url.startsWith('/health?')) {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('ok');
     return;
   }
-
-  if (req.method !== "GET") {
-    send(res, 405, "method not allowed\n");
-    return;
-  }
-
-  if (!subscriptionPath.test(requestUrl.pathname)) {
-    send(res, 404, "not found\n");
-    return;
-  }
-
-  await proxySubscription(req, res, requestUrl.pathname, requestUrl.search);
+  res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Bad Request');
 });
 
-server.requestTimeout = timeoutMs + 5000;
-server.headersTimeout = timeoutMs + 5000;
-server.listen(port, "0.0.0.0", () => {
-  console.log(`subscription relay listening on ${port}`);
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
+
+wss.on('connection', (clientSocket, request) => {
+  const upstreamWsUrl = resolveUpstreamUrl(request.url);
+  if (!upstreamWsUrl) {
+    console.error('no upstream route for', request.url);
+    try {
+      clientSocket.close(1008, 'unknown path');
+    } catch {}
+    return;
+  }
+
+  const upstream = new WebSocket(upstreamWsUrl, {
+    perMessageDeflate: false,
+    handshakeTimeout: 15000,
+    headers: {
+      Host: request.headers.host || '',
+    },
+  });
+
+  const closeQuietly = (code, reason) => {
+    try {
+      if (clientSocket.readyState === WebSocket.OPEN) clientSocket.close(code, reason);
+    } catch {}
+    try {
+      if (upstream.readyState === WebSocket.OPEN) upstream.close(code, reason);
+    } catch {}
+  };
+
+  upstream.on('open', () => {
+    const pingMs = Number(process.env.RELAY_WS_PING_MS || 30000);
+    const pingTimer = setInterval(() => {
+      if (upstream.readyState === WebSocket.OPEN) upstream.ping();
+      if (clientSocket.readyState === WebSocket.OPEN) clientSocket.ping();
+    }, pingMs);
+    pingTimer.unref?.();
+
+    const stopPing = () => clearInterval(pingTimer);
+    upstream.once('close', stopPing);
+    clientSocket.once('close', stopPing);
+
+    clientSocket.on('message', (data, isBinary) => {
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+    });
+    upstream.on('message', (data, isBinary) => {
+      if (clientSocket.readyState === WebSocket.OPEN) clientSocket.send(data, { binary: isBinary });
+    });
+  });
+
+  upstream.on('error', (err) => {
+    console.error(`upstream error (${upstreamWsUrl}):`, err.message);
+    closeQuietly(1011, 'upstream error');
+  });
+  clientSocket.on('error', (err) => {
+    console.error('client error:', err.message);
+    closeQuietly(1011, 'client error');
+  });
+  upstream.on('close', () => closeQuietly());
+  clientSocket.on('close', () => closeQuietly());
+});
+
+server.listen(PORT, () => {
+  if (UPSTREAM_ROUTES) {
+    const paths = [...UPSTREAM_ROUTES.keys()].join(', ');
+    console.log(`vpn-ws-relay listening on :${PORT} routes: ${paths}`);
+  } else {
+    console.log(`vpn-ws-relay listening on :${PORT} -> ${UPSTREAM_WS_URL}`);
+  }
 });
